@@ -307,22 +307,49 @@ def desktop_notify(title: str, text: str, url: str | None = None) -> bool:
     return True
 
 
+def smtp_login(cfg: Config) -> smtplib.SMTP:
+    """A logged-in SMTP connection (raises if the server or login fails)."""
+    context = ssl.create_default_context()
+    if cfg.smtp_port == 465:
+        smtp = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, context=context, timeout=30)
+    else:
+        smtp = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=30)
+    try:
+        if cfg.smtp_port != 465:
+            smtp.starttls(context=context)
+        smtp.login(cfg.smtp_user, cfg.smtp_password)
+    except Exception:
+        smtp.close()
+        raise
+    return smtp
+
+
 def send_email(cfg: Config, subject: str, body: str) -> None:
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = cfg.email_from
     msg["To"] = ", ".join(cfg.email_to)
     msg.set_content(body)
-    context = ssl.create_default_context()
-    if cfg.smtp_port == 465:
-        with smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, context=context, timeout=30) as smtp:
-            smtp.login(cfg.smtp_user, cfg.smtp_password)
-            smtp.send_message(msg)
-    else:
-        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=30) as smtp:
-            smtp.starttls(context=context)
-            smtp.login(cfg.smtp_user, cfg.smtp_password)
-            smtp.send_message(msg)
+    with smtp_login(cfg) as smtp:
+        smtp.send_message(msg)
+
+
+def email_startup_problem(cfg: Config) -> str | None:
+    """Like Config.email_problem, but also proves the login works (3 tries, for network blips)."""
+    problem = cfg.email_problem()
+    if problem:
+        return problem
+    for attempt in range(3):
+        try:
+            smtp_login(cfg).quit()
+            return None
+        except smtplib.SMTPAuthenticationError as exc:
+            return f"login rejected: {email_error_hint(exc)}"
+        except Exception as exc:
+            problem = f"login to {cfg.smtp_host} failed: {exc}"
+            if attempt < 2:
+                time.sleep(20)
+    return problem
 
 
 def email_error_hint(exc: Exception) -> str:
@@ -566,11 +593,18 @@ def main() -> None:
 
     if cfg.prevent_sleep:
         keep_awake()
-    problem = cfg.email_problem()
     log.info("Solar checker started: every %ds, alerting on products at or below %.2f.",
              cfg.interval, cfg.max_price)
+    problem = email_startup_problem(cfg)
+    if problem and os.environ.get("CI"):
+        # On GitHub, email is the only way to reach you: fail loudly (red run + GitHub's
+        # failure email) rather than watch silently for hours.
+        log.error("Email isn't working (%s). Stopping - fix the repository secrets "
+                  "and run the workflow again.", problem)
+        sys.exit(1)
     # Count only: logs on GitHub are public in a public repo, so no addresses here.
-    log.info("Email: %s", f"OFF ({problem})" if problem else f"on, to {len(cfg.email_to)} recipient(s)")
+    log.info("Email: %s", f"OFF ({problem})" if problem
+             else f"login OK, alerts go to {len(cfg.email_to)} recipient(s)")
     deadline = time.monotonic() + args.max_minutes * 60 if args.max_minutes else None
     watcher = Watcher(cfg)
     try:
