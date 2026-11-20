@@ -1,0 +1,29 @@
+name: Send test email
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_url:
+        description: Page whose first product goes into the test email
+        default: https://www.solar-guitars.com/shop/?min=229&max=3999
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show what the store looks like from GitHub
+        run: python3 solar_checker.py --dry-run
+
+      - name: Send test email
+        env:
+          PAGE_URL: ${{ inputs.page_url }}
+          SOLAR_SMTP_USER: ${{ secrets.SOLAR_SMTP_USER }}
+          SOLAR_SMTP_PASSWORD: ${{ secrets.SOLAR_SMTP_PASSWORD }}
+          SOLAR_EMAIL_TO: ${{ secrets.SOLAR_EMAIL_TO }}
+        run: python3 solar_checker.py --test "$PAGE_URL"

@@ -1,0 +1,8 @@
+# private settings (email login)
+config.local.ini
+
+# runtime files
+state.json
+state.tmp
+checker.log*
+__pycache__/
