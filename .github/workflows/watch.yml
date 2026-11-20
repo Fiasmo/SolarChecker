@@ -24,12 +24,13 @@ jobs:
 
       # state.json remembers which products were already reported,
       # so you aren't emailed again for the same product by every run.
+      # (v2: fresh start after the US-prices fix; the v1 state held US "$0" items.)
       - name: Restore state
         uses: actions/cache/restore@v6
         with:
           path: state.json
-          key: solar-state-${{ github.run_id }}
-          restore-keys: solar-state-
+          key: solar-state-v2-${{ github.run_id }}
+          restore-keys: solar-state-v2-
 
       - name: Check every minute
         env:
@@ -43,4 +44,4 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: state.json
-          key: solar-state-${{ github.run_id }}-${{ github.run_attempt }}
+          key: solar-state-v2-${{ github.run_id }}-${{ github.run_attempt }}

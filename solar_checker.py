@@ -38,6 +38,7 @@ import base64
 import configparser
 import ctypes
 import html
+import http.cookiejar
 import json
 import logging
 import logging.handlers
@@ -63,7 +64,14 @@ LOCAL_CONFIG_PATH = HERE / "config.local.ini"  # your private settings, not comm
 STATE_PATH = HERE / "state.json"
 LOG_PATH = HERE / "checker.log"
 
-STORE_API = "https://www.solar-guitars.com/wp-json/wc/store/v1/products"
+SITE = "https://www.solar-guitars.com/"
+STORE_API = SITE + "wp-json/wc/store/v1/products"
+# The store prices products per country and otherwise guesses the country from the
+# visitor's IP. GitHub's servers are in the US, where the store showed dozens of
+# guitars at "US $0.00" sale prices. This is the store's own country switch
+# (from its "Price Based on Country" plugin), used to ask for the Greek prices instead.
+COUNTRY_PARAM = "wcpbc-manual-country"
+COUNTRY_REFRESH_SECONDS = 15 * 60
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 HTTP_TIMEOUT = 30
@@ -77,6 +85,8 @@ log = logging.getLogger("solar")
 class Config:
     pages: list
     use_store_api: bool
+    country: str
+    currency: str
     max_price: float
     interval: int
     open_browser: bool
@@ -105,7 +115,7 @@ class Config:
 # Every setting can also come from an environment variable named SOLAR_<KEY>,
 # e.g. SOLAR_SMTP_PASSWORD. That's how GitHub Actions secrets reach the checker.
 CONFIG_KEYS = {
-    "checker": ("pages", "use_store_api", "max_price", "interval_seconds", "open_browser",
+    "checker": ("pages", "use_store_api", "country", "currency", "max_price", "interval_seconds", "open_browser",
                 "desktop_notification", "prevent_sleep", "warn_after_failures"),
     "email": ("smtp_host", "smtp_port", "smtp_user", "smtp_password", "email_from", "email_to"),
 }
@@ -128,6 +138,8 @@ def load_config() -> Config:
     return Config(
         pages=c.get("pages", "https://www.solar-guitars.com/shop/?min=0&max=1").split(),
         use_store_api=c.getboolean("use_store_api", True),
+        country=c.get("country", "GR").strip().upper(),
+        currency=c.get("currency", "EUR").strip().upper(),
         max_price=c.getfloat("max_price", 0.0),
         interval=max(15, c.getint("interval_seconds", 60)),
         # No screen to show anything on a CI server (GitHub Actions sets CI=true).
@@ -166,14 +178,29 @@ class Product:
         return "AVAILABLE (in stock)" if self.available else "listed, but out of stock / not buyable yet"
 
 
+# Keeps the store's session cookie, which remembers the chosen country for the pages.
+OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+_country_chosen_at: float | None = None
+
+
 def http_get(url: str) -> str:
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
         "Cache-Control": "no-cache",
     })
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+    with OPENER.open(req, timeout=HTTP_TIMEOUT) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def choose_country(country: str) -> None:
+    """Make the store pages show `country`'s prices for this session (refreshed every 15 min).
+    The pages can't take the country in their own URL: any extra parameter empties their list."""
+    global _country_chosen_at
+    if not country or (_country_chosen_at and time.monotonic() - _country_chosen_at < COUNTRY_REFRESH_SECONDS):
+        return
+    http_get(f"{SITE}?{urllib.parse.urlencode({COUNTRY_PARAM: country})}")
+    _country_chosen_at = time.monotonic()
 
 
 def clean_text(fragment: str) -> str:
@@ -212,20 +239,26 @@ def parse_shop_page(page: str) -> list:
     return products
 
 
-def fetch_store_api(max_price: float) -> list:
-    """Every product at or below max_price, via the WooCommerce Store API."""
+def fetch_store_api(max_price: float, country: str, currency: str) -> list:
+    """Every product at or below max_price in `country`, via the WooCommerce Store API."""
     # Store API price filters are in minor units (cents); +1 so a limit of 0
     # isn't read as "no limit".
     max_cents = int(round(max_price * 100)) + 1
     products = []
     for page in range(1, 11):
-        query = urllib.parse.urlencode(
-            {"min_price": 0, "max_price": max_cents, "per_page": 100, "page": page})
-        data = json.loads(http_get(f"{STORE_API}?{query}"))
+        params = {"min_price": 0, "max_price": max_cents, "per_page": 100, "page": page}
+        if country:
+            params[COUNTRY_PARAM] = country
+        data = json.loads(http_get(f"{STORE_API}?{urllib.parse.urlencode(params)}"))
         if not isinstance(data, list):
             raise ValueError(f"unexpected Store API response: {str(data)[:200]}")
         for item in data:
             prices = item.get("prices") or {}
+            answered_in = (prices.get("currency_code") or "").upper()
+            if currency and answered_in and answered_in != currency:
+                # Another country's prices (like the US "$0.00" ones): don't trust any of it.
+                raise ValueError(f"answered in {answered_in} instead of {currency}, so the "
+                                 f"country setting ({country or 'none'}) wasn't applied")
             minor = int(prices.get("currency_minor_unit") or 2)
             price = float(prices.get("price") or 0) / 10 ** minor
             products.append(Product(
@@ -245,7 +278,7 @@ def check(cfg: Config):
     """Return ({pid: Product} at or below max_price, {source: count}, [errors])."""
     sources = []
     if cfg.use_store_api:  # first, so its fuller product names win when merging
-        sources.append(("Store API", lambda: fetch_store_api(cfg.max_price)))
+        sources.append(("Store API", lambda: fetch_store_api(cfg.max_price, cfg.country, cfg.currency)))
     # Fetch each URL exactly as given: the site serves them uncached, and extra
     # query parameters make it drop the product list.
     for url in cfg.pages:
@@ -253,6 +286,12 @@ def check(cfg: Config):
         sources.append((label, lambda url=url: parse_shop_page(http_get(url))))
 
     found, by_url, counts, errors = {}, {}, {}, []
+    try:
+        choose_country(cfg.country)
+    except Exception as exc:
+        # The pages are still safe to read: their price filter uses the store's base (EUR)
+        # prices. Counted as an error so this round can't make old products look new.
+        errors.append(f"choosing country {cfg.country}: {exc}")
     for label, fetch in sources:
         try:
             items = [p for p in fetch() if p.price <= cfg.max_price + 1e-9]
